@@ -1,0 +1,418 @@
+library(quantmod)
+library(DMwR)
+library(randomForest)#用于筛选变量的随机森林
+library(xts)#时间序列对象类
+library(nnet)#神经网络
+library(e1071)#支持向量机
+library(earth)#多元自适应回归
+
+getSymbols("^GSPC",from = "1970-01-01",to = "2017-05-31")
+colnames(GSPC) = c("Open","High","Low","Close","Volume","Adjusted")
+GSPC = na.omit(GSPC)
+
+#定义目标变量
+T.ind = function(quotes, tgt.margin = 0.01, n.days = 10){
+  v = apply(HLC(quotes),1,mean)#逐行求平均数，得到每日均价
+  r = matrix(NA, ncol = n.days, nrow = NROW(quotes))
+  #生成一个和数据集行数一样，记录接下来十天波动情况的矩阵
+  for (x in 1:n.days) r[,x] = Next(Delt(v, k = x),x)#计算波动
+  x = apply(r, 1, function(x) sum(x[x> tgt.margin | x< -tgt.margin]))
+  #逐行求和
+  if (is.xts(quotes))
+    xts(x, time(quotes))#将原矩阵的时间标签转移到函数生存矩阵中
+  else x
+}
+
+candleChart(last(GSPC,"3 months"), theme = 'white', TA = NULL)
+avgPrice = function(x) apply(HLC(x),1,mean)
+addAvgPrice = newTA(FUN = avgPrice, col = 1, legend = "AvgPrice")
+addT.ind = newTA(FUN = T.ind, col = 'red', legend = "Target Return")
+addAvgPrice(on=1)
+addT.ind()
+
+#预处理TTR包中的函数
+myATR = function(x) ATR(HLC(x)) [,"atr"]
+mySMI = function(x) SMI(HLC(x)) [,"SMI"]
+myADX = function(x) ADX(HLC(x)) [,"ADX"]
+myAroon = function(x) aroon(x[,c("High","Low")])$oscillator
+myBB = function(x) BBands(HLC(x)) [,"pctB"]
+myChaikinVol = function(x) Delt(chaikinVolatility(x[,c("High","Low")]))[,1]
+myCLV = function(x) EMA(CLV(HLC(x))) [,1] 
+myEMV = function(x) EMV(x[,c("High","Low", "Close")],x[,"Volume"]) [,2]
+myMACD <- function(x) MACD(Cl(x))[, 2]
+myMFI = function(x) MFI(x[,c("High","Low","Close")], x[,"Volume"])
+mySAR <- function(x) SAR(x[, c("High", "Close")])[, 1]
+myVolat = function(x) volatility(OHLC(x), calc = "garman") [,1]
+
+#建立模型
+data.model = specifyModel(T.ind(GSPC) ~ Delt(Cl(GSPC),k=1:10)+myATR(GSPC)
+                          + mySMI(GSPC) + myADX(GSPC) ++ myAroon(GSPC) 
+                          + myBB(GSPC) + myChaikinVol(GSPC) + myCLV(GSPC)
+                          + CMO(Cl(GSPC)) + EMA(Delt(Cl(GSPC)))
+                          + myEMV(GSPC) + myVolat(GSPC) 
+                          + myMACD(GSPC)+ myMFI(GSPC) + RSI(Cl(GSPC)) 
+                          + mySAR(GSPC) + runMean(Cl(GSPC)) 
+                          + runSD(Cl(GSPC))
+)
+
+#用随机森林筛选变量
+rf = buildModel(data.model, method = 'randomForest',
+                training.per = c(start(GSPC), index(GSPC["20081231"])),
+                ntree = 50, importance = T)
+varImpPlot(rf@fitted.model, type = 1)
+imp = importance(rf@fitted.model, type = 1)
+
+rownames(imp)[which(imp>10)]
+
+#将筛选出的变量加入到模型中
+data.model = specifyModel(T.ind(GSPC) ~ Delt(Cl(GSPC), k=1)
+                          + myATR(GSPC) + mySMI(GSPC) + myADX(GSPC) 
+                          + myVolat(GSPC) + myMACD(GSPC) + runMean(Cl(GSPC))
+                          + runSD(Cl(GSPC)) 
+                          )
+Tdata.train = as.data.frame(modelData(data.model,
+                            data.window = c('1970-01-02','2008-12-31')))
+Tdata.eval = na.omit(as.data.frame(modelData(data.model, 
+                            data.window = c('2009-01-01','2017-05-30'))))
+Tform = as.formula(paste("T.ind.GSPC ~ ",
+                         paste(colnames(Tdata.train)[2:8], collapse = "+")))
+
+#神经网络模型
+norm.data = scale(Tdata.train)#数据规整
+norm.eval = scale(Tdata.eval)
+nn = nnet(Tform, norm.data,size=10, decay =0.01,
+          maxit = 10000, linout = T, trace = F)
+norm.preds = predict(nn, norm.eval)
+preds = unscale(norm.preds,norm.eval)#反规整
+sigs.nn=trading.signals(preds, 0.1, -0.1)
+true.sigs = trading.signals(Tdata.eval[,"T.ind.GSPC"],0.1,-0.1)
+sigs.PR(sigs.nn, true.sigs)#查看模型精确度与召回率
+
+#支持向量机模型
+sv = svm(Tform, Tdata.train, gama = 0.001, cost = 100)
+s.preds = predict(sv, Tdata.eval)
+sigs.svm = trading.signals(s.preds, 0.1, -0.1)
+true.sigs = trading.signals(Tdata.eval[,"T.ind.GSPC"],0.1,-0.1)
+sigs.PR(sigs.svm, true.sigs)
+
+#多远自适应回归
+e = earth(Tform, Tdata.train)
+e.preds = predict(e, Tdata.eval)
+sigs.e = trading.signals(e.preds, 0.1,-0.1)
+true.sigs = trading.signals(Tdata.eval[, "T.ind.GSPC"],0.1,-0.1)
+sigs.PR(sigs.e, true.sigs)
+
+###########################
+### 定义交易策略
+###########################
+policy.1 <- function(signals,market,opened.pos,money,
+                     bet=0.2,hold.time=10,
+                     exp.prof=0.025, max.loss= 0.05
+)
+{
+  d <- NROW(market) # this is the ID of today
+  orders <- NULL
+  nOs <- NROW(opened.pos)
+  # nothing to do!
+  if (!nOs && signals[d] == 'h') return(orders)
+  
+  # First lets check if we can open new positions
+  # i) long positions
+  if (signals[d] == 'b' && !nOs) {
+    quant <- round(bet*money/market[d,'Close'],0)
+    if (quant > 0) 
+      orders <- rbind(orders,
+                      data.frame(order=c(1,-1,-1),order.type=c(1,2,3), 
+                                 val = c(quant,
+                                         market[d,'Close']*(1+exp.prof),
+                                         market[d,'Close']*(1-max.loss)
+                                 ),
+                                 action = c('open','close','close'),
+                                 posID = c(NA,NA,NA)
+                      )
+      )
+    
+    # ii) short positions  
+  } else if (signals[d] == 's' && !nOs) {
+    # this is the nr of stocks we already need to buy 
+    # because of currently opened short positions
+    need2buy <- sum(opened.pos[opened.pos[,'pos.type']==-1,
+                               "N.stocks"])*market[d,'Close']
+    quant <- round(bet*(money-need2buy)/market[d,'Close'],0)
+    if (quant > 0)
+      orders <- rbind(orders,
+                      data.frame(order=c(-1,1,1),order.type=c(1,2,3), 
+                                 val = c(quant,
+                                         market[d,'Close']*(1-exp.prof),
+                                         market[d,'Close']*(1+max.loss)
+                                 ),
+                                 action = c('open','close','close'),
+                                 posID = c(NA,NA,NA)
+                      )
+      )
+  }
+  
+  if (nOs) 
+    for(i in 1:nOs) {
+      if (d - opened.pos[i,'Odate'] >= hold.time)
+        orders <- rbind(orders,
+                        data.frame(order=-opened.pos[i,'pos.type'],
+                                   order.type=1,
+                                   val = NA,
+                                   action = 'close',
+                                   posID = rownames(opened.pos)[i]
+                        )
+        )
+    }
+  
+  orders
+}
+
+
+
+
+
+
+
+#测试案例
+
+date <- rownames(Tdata.train[9805,])
+market <- GSPC[paste(date,'/',sep='')][1:2105]
+
+# 利用SVM
+library(e1071)
+s <- svm(Tform,Tdata.train,cost=10,gamma=0.01)
+p <- predict(s,Tdata.eval)
+sig <- trading.signals(p,0.1,-0.1)
+
+# 来自包中的模拟交易系统
+t1 <- trading.simulator(market,sig,
+                        'policy.1',list(exp.prof=0.05,bet=0.2,hold.time=30))
+
+#输出测试结果
+t1
+summary(t1)
+
+
+tradingEvaluation(t1)
+
+
+plot(t1,market,theme='white',name='SP500')
+
+library(PerformanceAnalytics)
+rets <- Return.calculate(t1@trading$Equity)
+#进行类转换否则会报错
+rets = as.data.frame(rets)
+t1TradeEquity = as.data.frame(t1@trading$Equity)
+
+chart.CumReturns(rets,main='Cumulative returns of the strategy',ylab='returns')
+
+yearlyReturn(t1TradeEquity)
+plot(100*yearlyReturn(t1TradeEquity),
+     main='Yearly percentage returns of the trading system')
+abline(h=0,lty=2)
+
+
+table.CalendarReturns(a,digit = 2)
+table.DownsideRisk(a)
+
+
+
+
+
+
+
+
+
+
+###########################
+### 蒙特卡洛模拟
+###########################
+
+MC.svmR <- function(form,train,test,b.t=0.1,s.t=-0.1,...) {
+  require(e1071)
+  t <- svm(form,train,...)
+  p <- predict(t,test)
+  trading.signals(p,b.t,s.t)
+}
+MC.svmC <- function(form,train,test,b.t=0.1,s.t=-0.1,...) {
+  require(e1071)
+  tgtName <- all.vars(form)[1]
+  train[,tgtName] <- trading.signals(train[,tgtName],b.t,s.t)
+  t <- svm(form,train,...)
+  p <- predict(t,test)
+  factor(p,levels=c('s','h','b'))
+}
+MC.nnetR <- function(form,train,test,b.t=0.1,s.t=-0.1,...) {
+  require(nnet)
+  t <- nnet(form,train,...)
+  p <- predict(t,test)
+  trading.signals(p,b.t,s.t)
+}
+MC.nnetC <- function(form,train,test,b.t=0.1,s.t=-0.1,...) {
+  require(nnet)
+  tgtName <- all.vars(form)[1]
+  train[,tgtName] <- trading.signals(train[,tgtName],b.t,s.t)
+  t <- nnet(form,train,...)
+  p <- predict(t,test,type='class')
+  factor(p,levels=c('s','h','b'))
+}
+MC.earth <- function(form,train,test,b.t=0.1,s.t=-0.1,...) {
+  require(earth)
+  t <- earth(form,train,...)
+  p <- predict(t,test)
+  trading.signals(p,b.t,s.t)
+}
+singleModel <- function(form,train,test,learner,policy.func,...) {
+  p <- do.call(paste('MC',learner,sep='.'),list(form,train,test,...))
+  eval.stats(form,train,test,p,policy.func=policy.func)
+}
+slide <- function(form,train,test,learner,relearn.step,policy.func,...) {
+  real.learner <- learner(paste('MC',learner,sep='.'),pars=list(...))
+  p <- slidingWindowTest(real.learner,form,train,test,relearn.step)
+  p <- factor(p,levels=1:3,labels=c('s','h','b'))
+  eval.stats(form,train,test,p,policy.func=policy.func)
+}
+grow <- function(form,train,test,learner,relearn.step,policy.func,...) {
+  real.learner <- learner(paste('MC',learner,sep='.'),pars=list(...))
+  p <- growingWindowTest(real.learner,form,train,test,relearn.step)
+  p <- factor(p,levels=1:3,labels=c('s','h','b'))
+  eval.stats(form,train,test,p,policy.func=policy.func)
+}
+
+eval.stats <- function(form,train,test,preds,b.t=0.1,s.t=-0.1,...) {
+  # Signals evaluation
+  tgtName <- all.vars(form)[1]
+  test[,tgtName] <- trading.signals(test[,tgtName],b.t,s.t)
+  st <- sigs.PR(preds,test[,tgtName])
+  dim(st) <- NULL
+  names(st) <- paste(rep(c('prec','rec'),each=3),
+                     c('s','b','sb'),sep='.')
+  
+  # Trading evaluation
+  date <- rownames(test)[1]
+  market <- GSPC[paste(date,"/",sep='')][1:length(preds),]
+  trade.res <- trading.simulator(market,preds,...)
+  
+  c(st,tradingEvaluation(trade.res))
+}
+
+
+pol1 <- function(signals,market,op,money)
+  policy.1(signals,market,op,money,
+           bet=0.2,exp.prof=0.025,max.loss=0.05,hold.time=10)
+
+pol2 <- function(signals,market,op,money)
+  policy.1(signals,market,op,money,
+           bet=0.2,exp.prof=0.05,max.loss=0.05,hold.time=20)
+
+
+# The list of learners we will use
+TODO <- c('svmR','svmC','earth','nnetR','nnetC')
+
+# The data sets used in the comparison
+DSs <- list(dataset(Tform,Tdata.train,'SP500'))
+
+# Monte Carlo (MC) settings used
+MCsetts <- mcSettings(5,     # 20 repetitions of the MC exps
+                      4000,   
+                      3000,   
+                      1234)   # random number generator seed
+
+# Variants to try for all learners
+VARS <- list()
+VARS$svmR   <- list(cost=c(10,150),gamma=c(0.01,0.001),
+                    policy.func=c('pol1','pol2','pol3'))
+VARS$svmC   <- list(cost=c(10,150),gamma=c(0.01,0.001),
+                    policy.func=c('pol1','pol2','pol3'))
+VARS$earth <- list(nk=c(10,17),degree=c(1,2),thresh=c(0.01,0.001),
+                   policy.func=c('pol1','pol2','pol3'))
+VARS$nnetR  <- list(linout=T,maxit=750,size=c(5,10),
+                    decay=c(0.001,0.01),
+                    policy.func=c('pol1','pol2','pol3'))
+VARS$nnetC  <- list(maxit=750,size=c(5,10),decay=c(0.001,0.01),
+                    policy.func=c('pol1','pol2','pol3'))
+
+# main loop
+for(td in TODO) {
+  assign(td,
+         experimentalComparison(
+           DSs,         
+           c(
+             do.call('variants',
+                     c(list('singleModel',learner=td),VARS[[td]],
+                       varsRootName=paste('single',td,sep='.'))),
+             do.call('variants',
+                     c(list('slide',learner=td,
+                            relearn.step=c(60,120)),
+                       VARS[[td]],
+                       varsRootName=paste('slide',td,sep='.'))),
+             do.call('variants',
+                     c(list('grow',learner=td,
+                            relearn.step=c(60,120)),
+                       VARS[[td]],
+                       varsRootName=paste('grow',td,sep='.')))
+           ),
+           MCsetts)
+  )
+  
+  # save the results
+  save(list=td,file=paste(td,'Rdata',sep='.'))
+}
+
+
+load('svmR.Rdata')
+load('svmC.Rdata')
+load('earth.Rdata')
+load('nnetR.Rdata')
+load('nnetC.Rdata')
+
+
+
+tgtStats <- c('prec.sb','Ret','PercProf',
+              'MaxDD','SharpeRatio')
+allSysRes <- join(subset(svmR,stats=tgtStats),
+                  subset(svmC,stats=tgtStats),
+                  subset(nnetR,stats=tgtStats),
+                  subset(nnetC,stats=tgtStats),
+                  subset(earth,stats=tgtStats),
+                  by = 'variants')
+rankSystems(allSysRes,5,maxs=c(T,T,T,F,T))
+
+
+summary(subset(svmC,
+               stats=c('Ret','RetOverBH','PercProf','NTrades'),
+               vars=c('slide.svmC.v5','slide.svmC.v6')))
+
+
+fullResults <- join(svmR,svmC,earth,nnetC,nnetR,by='variants')
+nt <- statScores(fullResults,'NTrades')[[1]]
+rt <- statScores(fullResults,'Ret')[[1]]
+pp <- statScores(fullResults,'PercProf')[[1]]
+s1 <- names(nt)[which(nt > 20)]
+s2 <- names(rt)[which(rt > 0.5)]
+s3 <- names(pp)[which(pp > 40)]
+namesBest <- intersect(intersect(s1,s2),s3)
+
+
+compAnalysis(subset(fullResults,
+                    stats=tgtStats,
+                    vars=namesBest))
+
+
+plot(subset(fullResults,
+            stats=c('Ret','PercProf','MaxDD'),
+            vars=namesBest))
+
+#源代码中筛选出来的最有的模型是single.nnetR.v12
+getVariant('single.nnetR.v12',nnetR)
+
+model <- learner('MC.nnetR',list(maxit=750,linout=T,trace=F,size=10,decay=0.001))
+preds <- growingWindowTest(model,Tform,data,Tdata.eval,relearn.step=120)
+signals <- factor(preds,levels=1:3,labels=c('s','h','b'))
+date <- rownames(Tdata.eval)[1]
+market <- GSPC[paste(date,"/",sep='')][1:length(signals),]
+trade.res <- trading.simulator(market,signals,policy.func='pol2')
+
+
+plot(trade.res,market,theme='white',name='SP500 - final test')
